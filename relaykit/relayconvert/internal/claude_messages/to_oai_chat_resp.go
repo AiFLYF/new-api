@@ -373,24 +373,35 @@ func BuildMessageDeltaPatchUsage(claudeResponse *dto.ClaudeResponse, claudeInfo 
 	if usage.CacheCreationInputTokens == 0 && claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens > 0 {
 		usage.CacheCreationInputTokens = claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens
 	}
-	cacheCreation5m := 0
-	cacheCreation1h := 0
-	if usage.CacheCreation != nil {
+	start5m := claudeInfo.Usage.ClaudeCacheCreation5mTokens
+	start1h := claudeInfo.Usage.ClaudeCacheCreation1hTokens
+	hasStartSplit := start5m+start1h > 0
+
+	// Report a split only when one is known: the stored message_start split, or
+	// a delta object when message_start carried none. Otherwise the aggregate
+	// total stands alone and no bucket is invented.
+	var cacheCreation5m, cacheCreation1h int
+	switch {
+	case usage.CacheCreation != nil && hasStartSplit:
+		// message_start keeps the last word on the split; the delta only adds the
+		// cumulative total, whose growth belongs to 5m writes.
+		cacheCreation1h = start1h
+		cacheCreation5m = max(usage.CacheCreationInputTokens-start1h, 0)
+	case usage.CacheCreation != nil:
 		cacheCreation5m = usage.CacheCreation.Ephemeral5mInputTokens
 		cacheCreation1h = usage.CacheCreation.Ephemeral1hInputTokens
-	} else {
-		cacheCreation5m = claudeInfo.Usage.ClaudeCacheCreation5mTokens
-		cacheCreation1h = claudeInfo.Usage.ClaudeCacheCreation1hTokens
+	case hasStartSplit:
+		cacheCreation5m, cacheCreation1h = start5m, start1h
 	}
-	cacheCreation5m, cacheCreation1h = sharedclaude.NormalizeCacheCreationSplit(
-		usage.CacheCreationInputTokens,
-		cacheCreation5m,
-		cacheCreation1h,
-	)
-	if usage.CacheCreation == nil && (cacheCreation5m > 0 || cacheCreation1h > 0) {
-		usage.CacheCreation = &dto.ClaudeCacheCreationUsage{}
-	}
-	if usage.CacheCreation != nil {
+	if cacheCreation5m+cacheCreation1h > 0 {
+		cacheCreation5m, cacheCreation1h = sharedclaude.NormalizeCacheCreationSplit(
+			usage.CacheCreationInputTokens,
+			cacheCreation5m,
+			cacheCreation1h,
+		)
+		if usage.CacheCreation == nil {
+			usage.CacheCreation = &dto.ClaudeCacheCreationUsage{}
+		}
 		usage.CacheCreation.Ephemeral5mInputTokens = cacheCreation5m
 		usage.CacheCreation.Ephemeral1hInputTokens = cacheCreation1h
 	}
@@ -513,8 +524,11 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 			claudeInfo.Usage.UsageSemantic = "anthropic"
 			claudeInfo.Usage.PromptTokensDetails.CachedTokens = messageUsage.CacheReadInputTokens
 			claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens = messageUsage.CacheCreationInputTokens
-			claudeInfo.Usage.ClaudeCacheCreation5mTokens = messageUsage.GetCacheCreation5mTokens()
-			claudeInfo.Usage.ClaudeCacheCreation1hTokens = messageUsage.GetCacheCreation1hTokens()
+			claudeInfo.Usage.ClaudeCacheCreation5mTokens, claudeInfo.Usage.ClaudeCacheCreation1hTokens = sharedclaude.ClampCacheCreationSplit(
+				messageUsage.CacheCreationInputTokens,
+				messageUsage.GetCacheCreation5mTokens(),
+				messageUsage.GetCacheCreation1hTokens(),
+			)
 			claudeInfo.Usage.CompletionTokens = messageUsage.OutputTokens
 			updateClaudeStreamBillingUsage(messageUsage, claudeInfo, false)
 		}
@@ -533,6 +547,9 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 	} else if claudeResponse.Type == "message_delta" {
 		if claudeResponse.Usage != nil {
 			claudeInfo.Usage.UsageSemantic = "anthropic"
+			startTotal := claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens
+			start5m := claudeInfo.Usage.ClaudeCacheCreation5mTokens
+			start1h := claudeInfo.Usage.ClaudeCacheCreation1hTokens
 			if claudeResponse.Usage.InputTokens > 0 {
 				claudeInfo.Usage.PromptTokens = claudeResponse.Usage.InputTokens
 			}
@@ -542,12 +559,22 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 			if claudeResponse.Usage.CacheCreationInputTokens > 0 {
 				claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens = claudeResponse.Usage.CacheCreationInputTokens
 			}
-			if cacheCreation5m := claudeResponse.Usage.GetCacheCreation5mTokens(); cacheCreation5m > 0 {
-				claudeInfo.Usage.ClaudeCacheCreation5mTokens = cacheCreation5m
+			// message_start owns the split. A delta may only report the cumulative
+			// total, so writes appended after it belong to 5m; its own cache_creation
+			// object is adopted only when message_start reported no split at all.
+			cacheCreation5m, cacheCreation1h := start5m, start1h
+			switch {
+			case start5m+start1h > 0:
+				cacheCreation5m += max(claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens-startTotal, 0)
+			case claudeResponse.Usage.CacheCreation != nil:
+				cacheCreation5m = claudeResponse.Usage.CacheCreation.Ephemeral5mInputTokens
+				cacheCreation1h = claudeResponse.Usage.CacheCreation.Ephemeral1hInputTokens
 			}
-			if cacheCreation1h := claudeResponse.Usage.GetCacheCreation1hTokens(); cacheCreation1h > 0 {
-				claudeInfo.Usage.ClaudeCacheCreation1hTokens = cacheCreation1h
-			}
+			claudeInfo.Usage.ClaudeCacheCreation5mTokens, claudeInfo.Usage.ClaudeCacheCreation1hTokens = sharedclaude.ClampCacheCreationSplit(
+				claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens,
+				cacheCreation5m,
+				cacheCreation1h,
+			)
 			if claudeResponse.Usage.OutputTokens > 0 {
 				claudeInfo.Usage.CompletionTokens = claudeResponse.Usage.OutputTokens
 			}

@@ -109,7 +109,7 @@ func TestBuildMessageDeltaPatchUsage(t *testing.T) {
 		require.EqualValues(t, 6, usage.CacheCreationInputTokens)
 	})
 
-	t.Run("default aggregate cache creation to 5m when split missing", func(t *testing.T) {
+	t.Run("omit cache creation when split missing", func(t *testing.T) {
 		claudeResponse := &dto.ClaudeResponse{Usage: &dto.ClaudeUsage{
 			OutputTokens:             53,
 			CacheCreationInputTokens: 50,
@@ -122,8 +122,9 @@ func TestBuildMessageDeltaPatchUsage(t *testing.T) {
 
 		usage := buildMessageDeltaPatchUsage(claudeResponse, claudeInfo)
 		require.NotNil(t, usage)
-		require.NotNil(t, usage.CacheCreation)
-		require.EqualValues(t, 50, usage.CacheCreation.Ephemeral5mInputTokens)
-		require.EqualValues(t, 0, usage.CacheCreation.Ephemeral1hInputTokens)
+		// The aggregate total is still reported, but no 5m bucket is invented
+		// when neither frame knows the 5m/1h split.
+		require.EqualValues(t, 50, usage.CacheCreationInputTokens)
+		require.Nil(t, usage.CacheCreation)
 	})
 }

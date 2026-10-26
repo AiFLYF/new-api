@@ -421,7 +421,7 @@ func TestNormalizeCacheCreationSplit(t *testing.T) {
 	assert.Equal(t, 2, cache1h)
 
 	cache5m, cache1h = NormalizeCacheCreationSplit(3, 5, 1)
-	assert.Equal(t, 5, cache5m)
+	assert.Equal(t, 2, cache5m)
 	assert.Equal(t, 1, cache1h)
 }
 
