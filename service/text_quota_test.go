@@ -1705,3 +1705,105 @@ func TestPostTextConsumeQuotaLogsMissingUsageAsStructuredContent(t *testing.T) {
 		map[string]any{"key": "Upstream returned no usage, so nothing was charged (possibly an upstream timeout)"},
 	}, other["content_parts"])
 }
+
+// TestLegacyPriceAudioSettlementUsesModelPrice covers issue #8023: under legacy
+// per-request pricing (UsePrice) the audio and realtime settlement paths must
+// pass the model price into QuotaInfo, otherwise a request whose usage carries
+// audio tokens settles as 0 and refunds the whole pre-consume.
+func TestLegacyPriceAudioSettlementUsesModelPrice(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	oldDB, oldLogDB := model.DB, model.LOG_DB
+	oldMainType, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = oldDB, oldLogDB
+		common.SetDatabaseTypes(oldMainType, oldLogType)
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Log{}))
+
+	const (
+		startingQuota = 1_000_000
+		wantQuota     = 10_000 // 0.02 USD * QuotaPerUnit(500000), group ratio 1
+	)
+	audioUsage := &dto.Usage{
+		PromptTokens:     12,
+		CompletionTokens: 17,
+		TotalTokens:      29,
+		PromptTokensDetails: dto.InputTokenDetails{
+			TextTokens:  4,
+			AudioTokens: 8,
+		},
+		CompletionTokenDetails: dto.OutputTokenDetails{
+			AudioTokens: 17,
+		},
+	}
+	realtimeUsage := &dto.RealtimeUsage{
+		TotalTokens:        29,
+		InputTokens:        12,
+		OutputTokens:       17,
+		InputTokenDetails:  dto.InputTokenDetails{TextTokens: 4, AudioTokens: 8},
+		OutputTokenDetails: dto.OutputTokenDetails{TextTokens: 0, AudioTokens: 17},
+	}
+	for _, tc := range []struct {
+		name   string
+		settle func(*gin.Context, *relaycommon.RelayInfo)
+	}{
+		{"audio", func(ctx *gin.Context, info *relaycommon.RelayInfo) {
+			PostAudioConsumeQuota(ctx, info, audioUsage, nil)
+		}},
+		{"realtime", func(ctx *gin.Context, info *relaycommon.RelayInfo) {
+			PostWssConsumeQuota(ctx, info, info.OriginModelName, realtimeUsage, nil)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := model.User{Username: fmt.Sprintf("legacy_price_%s", tc.name), AffCode: fmt.Sprintf("legacy_%s", tc.name), Quota: startingQuota, Status: common.UserStatusEnabled}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: fmt.Sprintf("legacy-price-%s", tc.name), Name: "legacy-price", RemainQuota: startingQuota, Status: common.TokenStatusEnabled}
+			require.NoError(t, db.Create(&token).Error)
+			channel := model.Channel{Name: "legacy-price", Key: "unused", Status: common.ChannelStatusEnabled}
+			require.NoError(t, db.Create(&channel).Error)
+
+			info := &relaycommon.RelayInfo{
+				UserId:          user.Id,
+				TokenId:         token.Id,
+				TokenKey:        token.Key,
+				ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channel.Id, UpstreamModelName: "tts-1"},
+				OriginModelName: "tts-1",
+				UsingGroup:      "default",
+				UserGroup:       "default",
+				UserSetting:     dto.UserSetting{BillingPreference: "wallet_only"},
+				ForcePreConsume: true,
+				StartTime:       time.Now(),
+				RelayFormat:     types.RelayFormatOpenAI,
+				PriceData: hosttypes.PriceData{
+					UsePrice:       true,
+					ModelPrice:     0.02,
+					GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1},
+				},
+			}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/v1/audio/speech", nil)
+
+			require.Nil(t, PreConsumeBilling(ctx, wantQuota, info))
+			held, err := model.GetUserQuota(user.Id, true)
+			require.NoError(t, err)
+			require.Equal(t, startingQuota-wantQuota, held)
+
+			tc.settle(ctx, info)
+
+			log := getLastLog(t)
+			require.NotNil(t, log)
+			assert.Equal(t, wantQuota, log.Quota)
+			var settled model.User
+			require.NoError(t, db.First(&settled, user.Id).Error)
+			assert.Equal(t, startingQuota-wantQuota, settled.Quota)
+			assert.Equal(t, wantQuota, settled.UsedQuota)
+		})
+	}
+}
